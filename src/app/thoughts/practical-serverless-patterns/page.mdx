@@ -1,0 +1,282 @@
+import Link from 'next/link';
+import { ArrowLeft } from 'lucide-react';
+
+export const metadata = {
+  title: 'Mastering Serverless Patterns: DynamoDB Streams with TypeScript',
+  author: 'Godfrey Willies Wanjala',
+}
+
+
+
+<article className="font-sans prose prose-lg max-w-none prose-p:text-blue-900 prose-headings:text-blue-900 prose-headings:font-bold prose-a:text-blue-600 prose-a:no-underline hover:prose-a:underline prose-pre:bg-transparent prose-pre:p-0 prose-pre:m-0 prose-strong:text-blue-950 prose-li:marker:text-blue-500">
+
+# Mastering Serverless Patterns: DynamoDB Streams with TypeScript
+
+Recently, I implemented an event dispatcher in TypeScript designed to handle high-throughput streams cleanly. The goal was to abstract away the AWS noise so the rest of the team could focus on feature development.
+
+To do this effectively, I relied on three classic design patterns: **Singleton**, **Adapter**, and **Observer**. Here is how they look in practice in a serverless environment.
+
+## 1. The Singleton Pattern: Managing State in Lambda
+
+In an AWS Lambda environment, the execution context is ephemeral, but it is often reused across subsequent invocations ("warm starts").
+
+When dealing with an event dispatcher, we need a guarantee: there must be exactly one registry of event listeners. If we accidentally spin up multiple registries, we risk fragmented state, duplicate processing, or missed events.
+
+We implement the Singleton pattern to ensure that no matter how many times the lambda is invoked warmly, we are always interacting with the same central dispatcher instance.
+
+```typescript
+class StreamDispatcher {
+    // The single instance reference
+    private static instance: StreamDispatcher | null = null;
+
+    // A private constructor blocks 'new StreamDispatcher()' calls from outside
+    private constructor() {
+        // Initialize registry maps here
+    }
+
+    // The global access point
+    static getInstance(): StreamDispatcher {
+        if (!StreamDispatcher.instance) {
+            StreamDispatcher.instance = new StreamDispatcher();
+        }
+        return StreamDispatcher.instance;
+    }
+    
+    // ... methods for subscribing and notifying later
+}
+```
+
+By forcing access via `getInstance()`, we ensure that every part of our application subscribes to the same central "switchboard."
+
+## 2. The Adapter Pattern: The Anti-Corruption Layer
+
+The core issue with DynamoDB Streams is the data format. If your `LoanService` or `AuditService` has to manually parse `{ "S": "some string" }`, your business logic is corrupted by infrastructure details.
+
+We use the Adapter pattern to create an "anti-corruption layer." This layer sits at the entry point of our dispatcher. Its sole job is to accept the "dirty" raw infrastructure event and adapt it into a clean, type-safe application context before passing it downstream.
+
+We lean on the AWS SDK's `unmarshall` utility to do the heavy lifting.
+
+```typescript
+import { unmarshall } from "@aws-sdk/util-dynamodb";
+import { DynamoDBRecord } from "aws-lambda";
+
+// ... inside the StreamDispatcher class
+
+    // The Adapter Method
+    private buildContext(record: DynamoDBRecord): CleanContext<any> {
+        const { eventName, eventSourceARN, dynamodb } = record;
+
+        // We adapt the raw event into a clean domain object
+        return {
+            // TRANSFORMATION: Marshalled JSON -> Pure Typescript Object
+            oldImage: dynamodb?.OldImage ? unmarshall(dynamodb.OldImage as any) : {},
+            newImage: dynamodb?.NewImage ? unmarshall(dynamodb.NewImage as any) : {},
+            
+            // NORMALIZATION: Standardize event names (e.g., "MODIFY" becomes "UPDATE")
+            eventType: this.normalizeEventName(eventName),
+            // Extract the model name from the ARN (e.g., "LoanTable" -> "Loan")
+            modelName: this.extractModelName(eventSourceARN),
+        };
+    }
+```
+
+Because of this adapter, the rest of our application never needs to know about DynamoDB's quirky JSON structure. They receive fully typed, standard TypeScript objects.
+
+## 3. The Observer Pattern: Decoupling Reactions
+
+In a growing system, a single data change often triggers multiple distinct actions. For example, when a Loan is approved, we might need to:
+
+1.  Send a notification email.
+2.  Update a separate ledger database.
+3.  Log the action for compliance audit.
+
+Tightly coupling the dispatcher to these specific services creates a monolithic mess of if/else statements.
+
+The **Observer pattern** (essentially a Pub/Sub mechanism) solves this. Our dispatcher acts as the "Subject," maintaining a registry of callbacks ("Observers"). The dispatcher doesn't know what the observers do; it just knows to notify them when a specific event occurs.
+
+```typescript
+// ... inside the StreamDispatcher class
+
+    // The Registry: Mapping event keys to a list of callback functions
+    private registry: Map<string, CallbackFn<any>[]> = new Map();
+
+    // The Subscription Method (Public API)
+    public onModelChange<T>(modelName: string, callback: CallbackFn<T>): void {
+        const key = `CHANGE:${modelName}`;
+        
+        if (!this.registry.has(key)) {
+             this.registry.set(key, []);
+        }
+        this.registry.get(key)?.push(callback);
+    }
+
+    // The Notification Loop (Internal)
+    private async notifyObservers(eventType: string, context: CleanContext<any>) {
+        const key = `${eventType}:${context.modelName}`;
+        const observers = this.registry.get(key) || [];
+        
+        // Execute all registered callbacks concurrently
+        await Promise.all(observers.map(cb => cb(context)));
+    }
+```
+
+This adheres to the Open/Closed Principle. We can add a new `FraudDetectionService` that listens to loan changes without ever needing to modify the core dispatcher code.
+
+## Putting It All Together: The Full Implementation
+
+Here is the complete `StreamDispatcher` class, combining all three patterns into a cohesive utility.
+
+```typescript
+import { unmarshall } from "@aws-sdk/util-dynamodb";
+import { DynamoDBRecord, DynamoDBStreamEvent } from "aws-lambda";
+
+// Types for our clean, domain-centric context
+export type EventAction = 'INSERT' | 'MODIFY' | 'REMOVE';
+export interface CleanContext<T> {
+    oldImage: T | null;
+    newImage: T | null;
+    action: EventAction;
+    modelName: string;
+    timestamp: number;
+}
+
+// Type for the observer callbacks
+type CallbackFn<T> = (context: CleanContext<T>) => Promise<void>;
+
+
+export class StreamDispatcher {
+    // --- SINGLETON PATTERN ---
+    private static instance: StreamDispatcher | null = null;
+
+    // Private constructor blocks external 'new' calls
+    private constructor() {}
+
+    static getInstance(): StreamDispatcher {
+        if (!StreamDispatcher.instance) {
+            StreamDispatcher.instance = new StreamDispatcher();
+        }
+        return StreamDispatcher.instance;
+    }
+
+    // --- OBSERVER PATTERN (Registry) ---
+    private registry: Map<string, CallbackFn<any>[]> = new Map();
+
+    /**
+     * Public API for services to subscribe to changes.
+     * Example: stream.onModelChange<Loan>('Loan', async (ctx) => { ... })
+     */
+    public onModelChange<T>(modelName: string, callback: CallbackFn<T>): void {
+        const key = `CHANGE:${modelName.toUpperCase()}`;
+        if (!this.registry.has(key)) {
+             this.registry.set(key, []);
+        }
+        this.registry.get(key)?.push(callback);
+    }
+
+    /**
+     * The main entry point called by the Lambda handler.
+     * It iterates through records, adapts them, and notifies observers.
+     */
+    public async processEvent(event: DynamoDBStreamEvent): Promise<void> {
+        const processingPromises = event.Records.map(async (record) => {
+            try {
+                // 1. Adapt
+                const context = this.buildContext(record);
+                // 2. Notify
+                await this.notifyObservers(context);
+            } catch (error) {
+                console.error("Failed to process record", record.eventID, error);
+                // In production, you might send to an SQS Dead Letter Queue here
+                throw error; 
+            }
+        });
+        
+        // Wait for all records in the batch to be processed
+        await Promise.all(processingPromises);
+    }
+
+    // --- ADAPTER PATTERN ---
+    private buildContext(record: DynamoDBRecord): CleanContext<any> {
+        const { eventName, eventSourceARN, dynamodb } = record;
+
+        if (!dynamodb) throw new Error("Invalid DynamoDB record format");
+
+        return {
+            // TRANSFORMATION: Marshalled JSON -> Pure Typescript Object
+            oldImage: dynamodb.OldImage ? unmarshall(dynamodb.OldImage as any) : null,
+            newImage: dynamodb.NewImage ? unmarshall(dynamodb.NewImage as any) : null,
+            
+            // NORMALIZATION: Standardize event names and extract model
+            action: eventName as EventAction,
+            modelName: this.extractModelName(eventSourceARN),
+            timestamp: Date.now()
+        };
+    }
+
+    // --- OBSERVER PATTERN (Notification) ---
+    private async notifyObservers(context: CleanContext<any>) {
+        // Match subscribers based on the model name (e.g., CHANGE:LOAN)
+        const key = `CHANGE:${context.modelName.toUpperCase()}`;
+        const observers = this.registry.get(key) || [];
+        
+        if (observers.length === 0) {
+            console.log(`No listeners found for ${key}`);
+            return;
+        }
+
+        // Execute all registered callbacks concurrently
+        // Using Promise.allSettled to ensure one failure doesn't stop others
+        const results = await Promise.allSettled(observers.map(cb => cb(context)));
+        
+        // Check for any rejected promises in the listeners
+        const rejected = results.filter(r => r.status === 'rejected');
+        if (rejected.length > 0) {
+            console.error(`${rejected.length} observers failed for ${key}`);
+            // Depending on requirements, you might throw here to fail the batch
+        }
+    }
+
+    /**
+     * Helper to parse the table name from the long ARN string.
+     * e.g., "arn:aws:dynamodb:us-east-1:123:table/LoanTable/stream/..." -> "LoanTable"
+     */
+    private extractModelName(arn?: string): string {
+         if (!arn) return 'UNKNOWN';
+         const parts = arn.split(':');
+         if (parts.length > 5 && parts[5].startsWith('table/')) {
+             return parts[5].split('/')[1];
+         }
+         return 'UNKNOWN';
+    }
+}
+```
+
+## The Result: A Clean Developer Experience
+
+Why go through the effort of implementing these patterns?
+
+It's about separating concerns. By abstracting the infrastructure complexity behind these robust patterns, we enable the rest of the team to write clean, feature-focused code.
+
+The complex reality of AWS Lambda triggers is hidden behind a simple, elegant API. A developer needing to write business logic doesn't need to worry about marshaling or stream parsing; they just subscribe to an event.
+
+Here is what the final usage looks like for a developer adding a new feature:
+
+```typescript
+// 1. Get the shared dispatcher instance
+const stream = StreamDispatcher.getInstance();
+
+// 2. Subscribe to changes on the "Loan" model, typing the response
+stream.onModelChange<LoanDocument>("Loan", async ({ newImage, eventType }) => {
+    
+    //Pure Business Logic happens here.
+    // The data is already clean TypeScript objects.
+    if (eventType === 'UPDATE' && newImage.status === 'APPROVED') {
+         await notificationService.sendApprovalEmail(newImage.userId);
+    }
+});
+```
+
+Design patterns aren't just academic concepts for textbooks. When applied correctly in serverless architectures, they are vital tools for keeping codebases maintainable and scalable as complexity grows.
+
+</article>
+
