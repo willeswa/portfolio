@@ -6,6 +6,7 @@ const nextConfig: NextConfig = {
   pageExtensions: ["js", "jsx", "md", "mdx", "ts", "tsx"],
   reactCompiler: true,
   output: "export",
+  basePath: "/portfolio",
   trailingSlash: true,
   images: {
     unoptimized: true,
